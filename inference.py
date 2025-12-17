@@ -166,17 +166,37 @@ def _load(checkpoint_path):
 	return checkpoint
 
 def load_model(path):
-	model = Wav2Lip()
-	print("Load checkpoint from: {}".format(path))
-	checkpoint = _load(path)
-	s = checkpoint["state_dict"]
-	new_s = {}
-	for k, v in s.items():
-		new_s[k.replace('module.', '')] = v
-	model.load_state_dict(new_s)
 
-	model = model.to(device)
-	return model.eval()
+    # 尝试普通加载
+    try:
+        if torch.cuda.is_available():
+            checkpoint = torch.load(path)
+        else:
+            checkpoint = torch.load(path, map_location=lambda storage, loc: storage)
+    except Exception as e:
+        print(f"Standard load failed, trying alternate method: {e}")
+        # 如果是特殊格式或者是 JIT 模型，这里可能需要特殊处理，但通常是因为文件本身有问题
+        # 或者文件就是一个 state_dict 本身，而不是包含 "state_dict" key 的字典
+        checkpoint = torch.load(path, map_location='cpu')
+
+    # 检查 checkpoint 的结构
+    if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+        s = checkpoint["state_dict"]
+    elif isinstance(checkpoint, dict):
+        # 也许整个文件就是 state_dict
+        s = checkpoint
+    else:
+        # 如果它是 ScriptModule 或其他对象
+        print("Warning: Model loaded is not a dictionary. It might be a TorchScript model.")
+        return checkpoint # 直接返回模型对象，这种情况下后续的 load_state_dict 会失败，需要根据情况调整
+
+    new_s = {}
+    for k, v in s.items():
+        new_s[k.replace('module.', '')] = v
+    model.load_state_dict(new_s)
+
+    model = model.to(device)
+    return model.eval()
 
 def main():
 	if not os.path.isfile(args.face):
