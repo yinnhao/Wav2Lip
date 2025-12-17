@@ -8,6 +8,11 @@ import torch, face_detection
 from models import Wav2Lip
 import platform
 
+try:
+	import onnxruntime as ort
+except ImportError:
+	ort = None
+
 parser = argparse.ArgumentParser(description='Inference code to lip-sync videos in the wild using Wav2Lip models')
 
 parser.add_argument('--checkpoint_path', type=str, 
@@ -166,37 +171,46 @@ def _load(checkpoint_path):
 	return checkpoint
 
 def load_model(path):
+	if path.endswith('.onnx'):
+		if ort is None:
+			raise ImportError("onnxruntime is required for loading .onnx models. Please install it.")
+		
+		providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if device == 'cuda' else ['CPUExecutionProvider']
+		sess = ort.InferenceSession(path, providers=providers)
+		return sess
 
-    # 尝试普通加载
-    try:
-        if torch.cuda.is_available():
-            checkpoint = torch.load(path)
-        else:
-            checkpoint = torch.load(path, map_location=lambda storage, loc: storage)
-    except Exception as e:
-        print(f"Standard load failed, trying alternate method: {e}")
-        # 如果是特殊格式或者是 JIT 模型，这里可能需要特殊处理，但通常是因为文件本身有问题
-        # 或者文件就是一个 state_dict 本身，而不是包含 "state_dict" key 的字典
-        checkpoint = torch.load(path, map_location='cpu')
+	# 尝试普通加载
+	try:
+		if torch.cuda.is_available():
+			checkpoint = torch.load(path)
+		else:
+			checkpoint = torch.load(path, map_location=lambda storage, loc: storage)
+	except Exception as e:
+		print(f"Standard load failed, trying alternate method: {e}")
+		# 如果是特殊格式或者是 JIT 模型，这里可能需要特殊处理，但通常是因为文件本身有问题
+		# 或者文件就是一个 state_dict 本身，而不是包含 "state_dict" key 的字典
+		checkpoint = torch.load(path, map_location='cpu')
 
-    # 检查 checkpoint 的结构
-    if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
-        s = checkpoint["state_dict"]
-    elif isinstance(checkpoint, dict):
-        # 也许整个文件就是 state_dict
-        s = checkpoint
-    else:
-        # 如果它是 ScriptModule 或其他对象
-        print("Warning: Model loaded is not a dictionary. It might be a TorchScript model.")
-        return checkpoint # 直接返回模型对象，这种情况下后续的 load_state_dict 会失败，需要根据情况调整
+	# 检查 checkpoint 的结构
+	if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+		s = checkpoint["state_dict"]
+	elif isinstance(checkpoint, dict):
+		# 也许整个文件就是 state_dict
+		s = checkpoint
+	else:
+		# 如果它是 ScriptModule 或其他对象
+		print("Warning: Model loaded is not a dictionary. It might be a TorchScript model.")
+		return checkpoint # 直接返回模型对象，这种情况下后续的 load_state_dict 会失败，需要根据情况调整
 
-    new_s = {}
-    for k, v in s.items():
-        new_s[k.replace('module.', '')] = v
-    model.load_state_dict(new_s)
+	new_s = {}
+	for k, v in s.items():
+		new_s[k.replace('module.', '')] = v
+	
+	model = Wav2Lip()
+	model.load_state_dict(new_s)
 
-    model = model.to(device)
-    return model.eval()
+	model = model.to(device)
+	return model.eval()
 
 def main():
 	if not os.path.isfile(args.face):
@@ -276,13 +290,22 @@ def main():
 			out = cv2.VideoWriter('temp/result.avi', 
 									cv2.VideoWriter_fourcc(*'DIVX'), fps, (frame_w, frame_h))
 
-		img_batch = torch.FloatTensor(np.transpose(img_batch, (0, 3, 1, 2))).to(device)
-		mel_batch = torch.FloatTensor(np.transpose(mel_batch, (0, 3, 1, 2))).to(device)
+		if args.checkpoint_path.endswith('.onnx'):
+			img_batch = np.transpose(img_batch, (0, 3, 1, 2)).astype(np.float32)
+			mel_batch = np.transpose(mel_batch, (0, 3, 1, 2)).astype(np.float32)
 
-		with torch.no_grad():
-			pred = model(mel_batch, img_batch)
+			sess_inputs = {model.get_inputs()[0].name: mel_batch, model.get_inputs()[1].name: img_batch}
+			pred = model.run(None, sess_inputs)[0]
 
-		pred = pred.cpu().numpy().transpose(0, 2, 3, 1) * 255.
+			pred = pred.transpose(0, 2, 3, 1) * 255.
+		else:
+			img_batch = torch.FloatTensor(np.transpose(img_batch, (0, 3, 1, 2))).to(device)
+			mel_batch = torch.FloatTensor(np.transpose(mel_batch, (0, 3, 1, 2))).to(device)
+
+			with torch.no_grad():
+				pred = model(mel_batch, img_batch)
+
+			pred = pred.cpu().numpy().transpose(0, 2, 3, 1) * 255.
 		
 		for p, f, c in zip(pred, frames, coords):
 			y1, y2, x1, x2 = c
