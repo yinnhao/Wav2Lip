@@ -278,14 +278,32 @@ def main():
 	full_frames = full_frames[:len(mel_chunks)]
 
 	batch_size = args.wav2lip_batch_size
+
+	# Load model first to check for ONNX input requirements (e.g. img_size)
+	model = load_model(args.checkpoint_path)
+	print ("Model loaded")
+
+	if args.checkpoint_path.endswith('.onnx'):
+		# Inspect ONNX inputs to adjust args
+		onnx_inputs = model.get_inputs()
+		for inp in onnx_inputs:
+			if 'face' in inp.name or 'img' in inp.name:
+				# Shape is typically [Batch, Channels, Height, Width]
+				# e.g. ['batch_size', 6, 512, 512]
+				h_idx = 2
+				w_idx = 3
+				if len(inp.shape) == 4:
+					if isinstance(inp.shape[h_idx], int) and isinstance(inp.shape[w_idx], int):
+						if inp.shape[h_idx] != args.img_size:
+							print(f"Adjusting img_size from {args.img_size} to {inp.shape[h_idx]} based on ONNX model input.")
+							args.img_size = inp.shape[h_idx]
+					break
+
 	gen = datagen(full_frames.copy(), mel_chunks)
 
 	for i, (img_batch, mel_batch, frames, coords) in enumerate(tqdm(gen, 
 											total=int(np.ceil(float(len(mel_chunks))/batch_size)))):
 		if i == 0:
-			model = load_model(args.checkpoint_path)
-			print ("Model loaded")
-
 			frame_h, frame_w = full_frames[0].shape[:-1]
 			out = cv2.VideoWriter('temp/result.avi', 
 									cv2.VideoWriter_fourcc(*'DIVX'), fps, (frame_w, frame_h))
@@ -294,9 +312,71 @@ def main():
 			img_batch = np.transpose(img_batch, (0, 3, 1, 2)).astype(np.float32)
 			mel_batch = np.transpose(mel_batch, (0, 3, 1, 2)).astype(np.float32)
 
-			sess_inputs = {model.get_inputs()[0].name: mel_batch, model.get_inputs()[1].name: img_batch}
-			pred = model.run(None, sess_inputs)[0]
+			# Debug ONNX inputs
+			if i == 0:
+				print(f"\nONNX Model Inputs:")
+				for inp in model.get_inputs():
+					print(f"Name: {inp.name}, Shape: {inp.shape}, Type: {inp.type}")
 
+			# Initialize hn and cn for each batch
+			# Looking at reference implementation, hn and cn are zeros with shape (batch_size, 2, 512)
+			# Reference: hn = np.zeros((img_numpy.shape[0], 2, 512), dtype=np.float16)
+			
+			# Check input types
+			onnx_inputs = model.get_inputs()
+			dtype = np.float32
+			for inp in onnx_inputs:
+				if 'float16' in inp.type:
+					dtype = np.float16
+					break
+			
+			if dtype == np.float16:
+				img_batch = img_batch.astype(np.float16)
+				mel_batch = mel_batch.astype(np.float16)
+			
+			hn = np.zeros((img_batch.shape[0], 2, 512), dtype=dtype)
+			cn = np.zeros((img_batch.shape[0], 2, 512), dtype=dtype)
+
+			# Reference code has hn/cn transpose: hn = hn.transpose(1, 0, 2)
+			hn = np.transpose(hn, (1, 0, 2))
+			cn = np.transpose(cn, (1, 0, 2))
+
+			sess_inputs = {
+				'audio': mel_batch,
+				'face': img_batch,
+				'in_hn': hn,
+				'in_cn': cn
+			}
+
+			try:
+				# Reference code: g, hn, cn = self.human_session.run(['pred_face', 'out_hn', 'out_cn'], inputs)
+				# We only care about pred_face for now
+				pred = model.run(['pred_face'], sess_inputs)[0]
+			except Exception as e:
+				print(f"ONNX Inference failed: {e}")
+				print("Attempting fallback with automatic input mapping...")
+				
+				# Fallback logic just in case names don't match exactly 'in_hn' etc
+				sess_inputs = {}
+				onnx_inputs = model.get_inputs()
+				for inp in onnx_inputs:
+					if 'audio' in inp.name or 'mel' in inp.name:
+						sess_inputs[inp.name] = mel_batch
+					elif 'face' in inp.name or 'img' in inp.name:
+						sess_inputs[inp.name] = img_batch
+					elif 'hn' in inp.name:
+						sess_inputs[inp.name] = hn
+					elif 'cn' in inp.name:
+						sess_inputs[inp.name] = cn
+				
+				try:
+					pred = model.run(None, sess_inputs)[0]
+				except Exception as e2:
+					print(f"Fallback failed: {e2}")
+					print(f"Input shapes: Audio {mel_batch.shape}, Face {img_batch.shape}, HN {hn.shape}, CN {cn.shape}")
+					sys.exit(1)
+
+			pred = pred.astype(np.float32) # Convert back to float32 for subsequent processing
 			pred = pred.transpose(0, 2, 3, 1) * 255.
 		else:
 			img_batch = torch.FloatTensor(np.transpose(img_batch, (0, 3, 1, 2))).to(device)
