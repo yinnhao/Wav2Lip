@@ -1,2 +1,4 @@
 # python inference.py --checkpoint_path checkpoints/Wav2Lip-SD-GAN.pt --face example/raw_video_shot_011.mp4 --audio example/audio_shot_011.wav
 python inference.py --checkpoint_path checkpoints/Wav2Lip-SD-NOGAN.pt --face example/raw_video_shot_011.mp4 --audio example/audio_shot_011.wav
+
+# python inference.py --checkpoint_path checkpoints/model.onnx --face example/raw_video_shot_011.mp4 --audio example/audio_shot_011.wav

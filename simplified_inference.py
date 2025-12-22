@@ -1,385 +1,437 @@
-#!/usr/bin/env python3
-# coding=utf-8
 import os
 import sys
-import argparse
-import json
-import subprocess
-import traceback
 import numpy as np
 import cv2
 import onnxruntime as ort
-from PIL import Image
-import io
-import shutil
+import argparse
+import subprocess
+from tqdm import tqdm
 import torch
-import torchaudio
+import face_detection
+import platform
+
+# 尝试导入 torchaudio 和 transformers 用于 HuBERT
 try:
+    import torchaudio
     from transformers import HubertModel
 except ImportError:
+    torchaudio = None
     HubertModel = None
+    print("Warning: torchaudio or transformers not found. HuBERT feature extraction will fail if needed.")
 
-# Constants from the analysis
-IMG_SIZE = 512 # Default, but model input shape might differ
-WAV2LIP_BATCH_SIZE = 8
-MEL_STEP_SIZE = 10 # Referenced from get_lips_result.py (rep_step_size)
-REP_IDX_MULTIPLIER = 2 # Referenced from get_lips_result.py
+def get_smoothened_boxes(boxes, T):
+    for i in range(len(boxes)):
+        if i + T > len(boxes):
+            window = boxes[len(boxes) - T:]
+        else:
+            window = boxes[i : i + T]
+        boxes[i] = np.mean(window, axis=0)
+    return boxes
+
+def face_detect(images, args):
+    detector = face_detection.FaceAlignment(face_detection.LandmarksType._2D, 
+                                            flip_input=False, device=args.device)
+
+    batch_size = args.face_det_batch_size
+    
+    while 1:
+        predictions = []
+        try:
+            for i in tqdm(range(0, len(images), batch_size)):
+                predictions.extend(detector.get_detections_for_batch(np.array(images[i:i + batch_size])))
+        except RuntimeError:
+            if batch_size == 1: 
+                raise RuntimeError('Image too big to run face detection on GPU. Please use the --resize_factor argument')
+            batch_size //= 2
+            print('Recovering from OOM error; New batch size: {}'.format(batch_size))
+            continue
+        break
+
+    results = []
+    pady1, pady2, padx1, padx2 = args.pads
+    
+    # Handle cases where face is not detected in some frames
+    last_valid_rect = None
+
+    for rect, image in zip(predictions, images):
+        if rect is None:
+            if last_valid_rect is not None:
+                rect = last_valid_rect # Temporal consistency fallback
+            else:
+                # If no face found yet, we might need to skip or error out
+                # For now, let's try to look ahead or just raise error if it's the first frame
+                # Or just use the whole image (bad idea)
+                # Let's raise error for now as in original script, but maybe log it
+                # cv2.imwrite('temp/faulty_frame.jpg', image)
+                # raise ValueError('Face not detected! Ensure the video contains a face in all the frames.')
+                # Try to use center crop?
+                h, w = image.shape[:2]
+                rect = [w//4, h//4, w*3//4, h*3//4] # Fallback dummy box
+        
+        last_valid_rect = rect
+
+        y1 = max(0, rect[1] - pady1)
+        y2 = min(image.shape[0], rect[3] + pady2)
+        x1 = max(0, rect[0] - padx1)
+        x2 = min(image.shape[1], rect[2] + padx2)
+        
+        results.append([x1, y1, x2, y2])
+
+    boxes = np.array(results)
+    if not args.nosmooth: boxes = get_smoothened_boxes(boxes, T=5)
+    results = [[image[y1: y2, x1:x2], (y1, y2, x1, x2)] for image, (x1, y1, x2, y2) in zip(images, boxes)]
+
+    del detector
+    return results
 
 class HubertFeatureExtractor:
     def __init__(self, model_path, device='cpu'):
         if HubertModel is None:
-            raise ImportError("transformers is required for HuBERT. Please pip install transformers.")
+            raise ImportError("transformers is required for HuBERT.")
         self.device = device
-        self.hubert_model = HubertModel.from_pretrained(model_path).to(self.device).eval()
+        
+        print(f"Loading HuBERT model from {model_path}...")
+        try:
+            self.hubert_model = HubertModel.from_pretrained(model_path).to(self.device).eval()
+        except Exception as e:
+            print(f"Standard loading failed: {e}. Trying manual loading (config + bin)...")
+            try:
+                config_path = os.path.join(model_path, "config.json")
+                bin_path = os.path.join(model_path, "pytorch_model.bin")
+                from transformers import HubertConfig
+                config = HubertConfig.from_pretrained(config_path)
+                self.hubert_model = HubertModel(config)
+                if os.path.exists(bin_path):
+                    state_dict = torch.load(bin_path, map_location=device)
+                    self.hubert_model.load_state_dict(state_dict, strict=False)
+                self.hubert_model = self.hubert_model.to(self.device).eval()
+            except Exception as e2:
+                print(f"Manual loading failed: {e2}")
+                raise e
 
     def infer(self, input_values):
-        """
-        Infer features from audio input (Batch, T)
-        Logic ported from hubert_audio/models/hubert.py
-        """
+        # Input: numpy array (1, T)
         input_values = torch.tensor(input_values).to(self.device)
         if input_values.ndim == 1:
             input_values = input_values.unsqueeze(0)
 
         with torch.no_grad():
-            kernel, stride = 400, 320
-            clip_length = stride * 1000
+            # Based on common HuBERT usage in Wav2Lip variants (e.g. SadTalker, Linly)
+            # The model outputs hidden states.
+            outputs = self.hubert_model(input_values)
+            hidden_states = outputs.last_hidden_state # (B, T, 1024)
             
-            # Simple case
-            if input_values.shape[1] <= clip_length:
-                hidden_states = self.hubert_model(input_values).last_hidden_state
-            else:
-                # Sliding window logic
-                num_iter = input_values.shape[1] // clip_length
-                expected_T = (input_values.shape[1] - (kernel - stride)) // stride
-                
-                slices = []
-                for i in range(num_iter):
-                    start_idx = i * clip_length
-                    end_idx = start_idx + (clip_length - stride + kernel)
-                    slices.append((start_idx, end_idx))
-
-                remaining_start = num_iter * clip_length
-                # Logic from original code: check if remaining is long enough
-                remaining = input_values[:, remaining_start:]
-                if remaining.shape[1] >= kernel:
-                    slices.append((remaining_start, input_values.shape[1]))
-
-                res_lst = []
-                for start, end in slices:
-                    chunk = input_values[:, start:end]
-                    # Ensure chunk is valid
-                    if chunk.shape[1] < kernel:
-                         continue
-                    clip_hidden_states = self.hubert_model(chunk).last_hidden_state
-                    res_lst.append(clip_hidden_states[0])
-                
-                if not res_lst:
-                     # Fallback if no slices? Should not happen if logic is correct
-                     hidden_states = self.hubert_model(input_values).last_hidden_state
-                else:
-                    ret = torch.cat(res_lst, dim=0) # (Total_T, 1024)
-                    
-                    # Pad or trim to expected_T
-                    if ret.shape[0] >= expected_T:
-                        ret = ret[:expected_T]
-                    else:
-                        ret = torch.nn.functional.pad(ret, (0, 0, 0, expected_T - ret.shape[0]))
-                    
-                    hidden_states = ret.unsqueeze(0) # (1, T, 1024)
-        
         return hidden_states.cpu().numpy()
 
-class Wav2LipInference:
-    def __init__(self, model_path, hubert_path=None, device='cpu'):
-        self.model_path = model_path
-        self.hubert_path = hubert_path
-        self.device = device
-        self.img_size = IMG_SIZE # Initialize with default
-        
-        # Load Wav2Lip Model
-        self.session = self.load_onnx_model(model_path)
-        
-        # Load HuBERT Model if provided
-        self.hubert_extractor = None
-        if hubert_path and os.path.exists(hubert_path):
-            try:
-                print(f"Loading HuBERT model from {hubert_path}...")
-                self.hubert_extractor = HubertFeatureExtractor(hubert_path, device)
-            except Exception as e:
-                print(f"Failed to load HuBERT model: {e}")
-        
-        # Check model input shapes to adjust IMG_SIZE
-        self.check_model_input()
+def datagen(frames, audio_tensor, face_det_results, args):
+    """
+    Generator that yields batches of (img_batch, mel_batch, frame_batch, coords_batch)
+    audio_tensor: (1, 1024, T) - Transposed HuBERT features
+    """
+    img_batch, mel_batch, frame_batch, coords_batch = [], [], [], []
 
-    def load_onnx_model(self, checkpoint_path):
-        """Load ONNX model"""
-        if self.device == 'cuda':
-            providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+    # Logic from get_lips_result.py: create_rep_chunks_faceresults
+    # But adapted for generator to save memory
+    
+    rep_step_size = 10
+    rep_idx_multiplier = 2  # Per video frame audio index multiplier (25fps video, 50Hz audio)
+    
+    # audio_tensor is expected to be (1, 1024, T)
+    # We iterate through frames
+    
+    n_frames = len(frames)
+    
+    for i in range(len(frames)):
+        # Calculate audio window
+        start_idx = int(i * rep_idx_multiplier)
+        
+        # Check boundary
+        if start_idx + rep_step_size > audio_tensor.shape[-1]:
+             # Padding or repeating last part? 
+             # get_lips_result.py logic:
+             # if start_idx > ... break
+             # else append last part
+             if start_idx > audio_tensor.shape[-1] - 1:
+                 break
+             m = audio_tensor[0, :, audio_tensor.shape[-1] - rep_step_size:]
         else:
-            providers = ['CPUExecutionProvider']
+            m = audio_tensor[0, :, start_idx : start_idx + rep_step_size]
+            
+        # m shape is (1024, 10) -> We might need to transpose it back for ONNX model?
+        # get_lips_result.py: rep_chunks.append(audio_tensor[...]) -> (1024, 10)
+        # Then in preprocess: mel_batch.append(m)
+        # Then: mel_batch = np.transpose(mel_batch, (0, 2, 1)) -> (B, 10, 1024)
+        # So here m is (1024, 10).
         
-        try:
-            print(f"Loading model from {checkpoint_path}...")
-            session = ort.InferenceSession(checkpoint_path, providers=providers)
-            return session
-        except Exception as e:
-            print(f"Error loading ONNX model: {e}")
-            sys.exit(1)
+        idx = i % len(frames)
+        frame_to_save = frames[idx].copy()
+        face, coords = face_det_results[idx] # face is already cropped
+        
+        face = cv2.resize(face, (args.img_size, args.img_size))
+        
+        img_batch.append(face)
+        mel_batch.append(m)
+        frame_batch.append(frame_to_save)
+        coords_batch.append(coords)
+        
+        if len(img_batch) >= args.wav2lip_batch_size:
+            # Batch preparation
+            img_batch_np = np.asarray(img_batch) # (B, H, W, 3)
+            mel_batch_np = np.asarray(mel_batch) # (B, 1024, 10)
+            
+            # Transpose mel to (B, 10, 1024) as expected by typical ONNX models
+            mel_batch_np = np.transpose(mel_batch_np, (0, 2, 1))
+            
+            # Prepare Image Batch for Wav2Lip (Masking + Concatenation)
+            # Standard Wav2Lip: (masked_face, reference_face)
+            img_masked = img_batch_np.copy()
+            img_masked[:, args.img_size//2:] = 0 # Mask lower half
+            
+            # Concatenate: (B, H, W, 6)
+            # Reference: typically Wav2Lip takes (reference_face, masked_face) or vice versa
+            # The original code: np.concatenate((img_masked, img_batch), axis=3)
+            # Let's verify standard Wav2Lip input order: (window, 6, H, W) where 6 is (face_with_masked_mouth, reference_face)
+            
+            # Let's try to match original inference.py:
+            # img_batch = np.concatenate((img_masked, img_batch), axis=3) / 255.
+            
+            # NOTE: In Wav2Lip, the input channel order is [masked_img, reference_img]
+            # masked_img: image with lower half masked
+            # reference_img: original image (or reference)
+            # The original code logic was:
+            # img_masked[:, args.img_size//2:] = 0
+            # img_batch = np.concatenate((img_masked, img_batch), axis=3) / 255.
+            # This matches our current logic: [masked, reference]
+            
+            img_input = np.concatenate((img_masked, img_batch_np), axis=3)
+            
+            # Normalize and Transpose to (B, 6, H, W)
+            img_input = img_input / 255.
+            img_input = np.transpose(img_input, (0, 3, 1, 2))
+            
+            yield img_input, mel_batch_np, frame_batch, coords_batch
+            
+            img_batch, mel_batch, frame_batch, coords_batch = [], [], [], []
 
-    def check_model_input(self):
-        """Check ONNX model input shapes"""
-        inputs = self.session.get_inputs()
-        for inp in inputs:
-            # Expected inputs: audio, face, in_hn, in_cn
-            print(f"Model Input: {inp.name}, Shape: {inp.shape}, Type: {inp.type}")
-            if 'face' in inp.name and len(inp.shape) == 4:
-                # Shape: [Batch, Channels, H, W]
-                h, w = inp.shape[2], inp.shape[3]
-                if isinstance(h, int) and isinstance(w, int):
-                    self.img_size = h
-                    print(f"Set IMG_SIZE to {self.img_size} based on model input.")
+    # Yield remaining
+    if len(img_batch) > 0:
+        img_batch_np = np.asarray(img_batch)
+        mel_batch_np = np.asarray(mel_batch)
+        mel_batch_np = np.transpose(mel_batch_np, (0, 2, 1))
+        
+        img_masked = img_batch_np.copy()
+        img_masked[:, args.img_size//2:] = 0
+        img_input = np.concatenate((img_masked, img_batch_np), axis=3)
+        img_input = img_input / 255.
+        img_input = np.transpose(img_input, (0, 3, 1, 2))
+        
+        yield img_input, mel_batch_np, frame_batch, coords_batch
 
-    def get_audio_features(self, audio_path):
-        """
-        Extract audio features.
-        If audio_path is .npy: load directly.
-        If audio_path is .wav: extract using HuBERT if available.
-        """
-        if audio_path.endswith('.npy'):
-            print(f"Loading pre-computed features from {audio_path}")
-            feat = np.load(audio_path)
-            # Ensure shape is (1, 1024, T)
-            if feat.ndim == 2:
-                # Assume (1024, T) -> (1, 1024, T)
-                feat = feat[np.newaxis, :, :]
-            return feat
-        else:
-            if self.hubert_extractor:
-                print(f"Extracting features from {audio_path} using HuBERT...")
-                try:
-                    # Load audio using torchaudio
-                    wav, sr = torchaudio.load(audio_path)
-                    if sr != 16000:
-                        resampler = torchaudio.transforms.Resample(sr, 16000)
-                        wav = resampler(wav)
-                    
-                    # Mix to mono if needed
-                    if wav.shape[0] > 1:
-                        wav = torch.mean(wav, dim=0, keepdim=True)
-                        
-                    input_values = wav.numpy()
-                    
-                    # Extract features: (1, T, 1024)
-                    hidden_states = self.hubert_extractor.infer(input_values)
-                    
-                    # Transpose to (1, 1024, T) as required by Wav2Lip
-                    feat = np.transpose(hidden_states, (0, 2, 1))
-                    
-                    print(f"Extracted features shape: {feat.shape}")
-                    return feat
-                    
-                except Exception as e:
-                    print(f"Error extracting features: {e}")
-                    traceback.print_exc()
-                    print("Falling back to placeholder.")
-
-            print(f"WARNING: Input is {audio_path}. The model expects 1024-dim features.")
-            if not self.hubert_extractor:
-                print("HuBERT model not loaded. Please provide --hubert_path to extract features from raw audio.")
-            
-            print("Returning a placeholder (random noise) for demonstration purposes.")
-            
-            # Placeholder: Estimate length based on duration
-            try:
-                # Use torchaudio to get duration
-                info = torchaudio.info(audio_path)
-                duration = info.num_frames / info.sample_rate
-                # Estimate T (approx 50Hz)
-                T = int(duration * 50) + 20 
-            except Exception:
-                print("Could not determine audio duration, defaulting to 10s.")
-                T = 500
-
-            return np.random.randn(1, 1024, T).astype(np.float32)
-
-    def preprocess_batch(self, img_batch, mel_batch):
-        """
-        Preprocess batch for inference, logic from process_wav2lip.py
-        img_batch: List of numpy images (H, W, 3) BGR (cv2 default)
-        mel_batch: List of audio chunks (10, 1024)
-        """
-        # Process Images
-        # process_wav2lip.py: 
-        # 1. transpose to (2, 0, 1) -> (C, H, W)
-        # 2. concatenate(image, image) axis=0 -> (2*C, H, W)
-        # 3. float16 -> float32 for ONNX
-        
-        imgs_np = []
-        for img in img_batch:
-            # Resize if needed
-            if img.shape[0] != self.img_size or img.shape[1] != self.img_size:
-                img = cv2.resize(img, (self.img_size, self.img_size))
-            
-            # CV2 is BGR, convert to RGB
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            
-            img = np.transpose(img, (2, 0, 1)).astype(np.float32) / 255.0
-            img_concat = np.concatenate((img, img), axis=0)
-            imgs_np.append(img_concat)
-            
-        imgs_np = np.array(imgs_np) # (Batch, 6, H, W)
-        
-        # Process Audio
-        # process_wav2lip.py: reshapes to (10, 1024)
-        # Here mel_batch is already (Batch, 10, 1024) based on our datagen logic
-        audio_np = np.array(mel_batch, dtype=np.float32)
-        
-        # Initialize hidden states
-        # hn, cn shape: (Batch, 2, 512)
-        hn = np.zeros((imgs_np.shape[0], 2, 512), dtype=np.float32)
-        cn = np.zeros((imgs_np.shape[0], 2, 512), dtype=np.float32)
-        
-        # Transpose hn, cn as in wav2lip.py infer()
-        # hn = hn.transpose(1, 0, 2) -> (2, Batch, 512)
-        hn = hn.transpose(1, 0, 2)
-        cn = cn.transpose(1, 0, 2)
-        
-        return imgs_np, audio_np, hn, cn
-
-    def run(self, frames, audio_feat, batch_size=WAV2LIP_BATCH_SIZE):
-        """
-        Main inference loop
-        frames: List of video frames
-        audio_feat: Audio features (1, 1024, T)
-        """
-        # Logic from get_lips_result.py: create_rep_chunks_faceresults
-        # But simplified since we assume frames are already face crops or full frames?
-        # The complex chain separates face detection (get_avatar_info) from inference.
-        # Here we assume frames are full frames, we might need face detection.
-        # But process_wav2lip.py seems to take *images* (bytes).
-        # Let's assume input frames are already the target face area or we resize the whole frame.
-        # For simplicity, we resize the whole frame to IMG_SIZE.
-        
-        results = []
-        
-        # Data generation
-        # Logic from get_lips_result.py
-        rep_chunks = []
-        # rep_idx_multiplier = 2
-        i = 0
-        while True:
-            start_idx = int(i * REP_IDX_MULTIPLIER)
-            if start_idx + MEL_STEP_SIZE > audio_feat.shape[-1]:
-                if start_idx > audio_feat.shape[-1] - 1:
-                    break
-                # Padding or partial chunk logic
-                chunk = audio_feat[0, :, audio_feat.shape[-1] - MEL_STEP_SIZE:]
-                rep_chunks.append(chunk)
-            else:
-                chunk = audio_feat[0, :, start_idx : start_idx + MEL_STEP_SIZE]
-                rep_chunks.append(chunk)
-            i += 1
-            
-        # Truncate to min length
-        min_len = min(len(frames), len(rep_chunks))
-        frames = frames[:min_len]
-        rep_chunks = rep_chunks[:min_len]
-        
-        print(f"Processing {min_len} frames in batches of {batch_size}...")
-        
-        for i in tqdm(range(0, min_len, batch_size)):
-            batch_frames = frames[i : i + batch_size]
-            batch_audio = rep_chunks[i : i + batch_size]
-            
-            # Prepare batch - Transpose audio chunk from (1024, 10) to (10, 1024)
-            # get_lips_result.py: mel_batch = np.transpose(mel_batch, (0, 2, 1))
-            batch_audio_transposed = [np.transpose(a, (1, 0)) for a in batch_audio]
-            
-            img_in, audio_in, hn_in, cn_in = self.preprocess_batch(batch_frames, batch_audio_transposed)
-            
-            inputs = {
-                'audio': audio_in,
-                'face': img_in,
-                'in_hn': hn_in,
-                'in_cn': cn_in
-            }
-            
-            # Run inference
-            # Output: pred_face, out_hn, out_cn
-            pred = self.session.run(['pred_face'], inputs)[0]
-            
-            # Postprocess
-            # wav2lip.py: g = (g.transpose(0, 2, 3, 1) * 255.).astype(np.uint8)
-            # pred shape: (Batch, C, H, W)
-            pred = pred.transpose(0, 2, 3, 1) * 255.0
-            pred = pred.clip(0, 255).astype(np.uint8)
-            
-            results.extend(pred)
-            
-        return results
+def load_onnx_model(path, device):
+    providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if device == 'cuda' else ['CPUExecutionProvider']
+    try:
+        sess = ort.InferenceSession(path, providers=providers)
+        return sess
+    except Exception as e:
+        print(f"Error loading ONNX model: {e}")
+        sys.exit(1)
 
 def main():
-    parser = argparse.ArgumentParser(description='Simplified Wav2Lip Inference')
-    parser.add_argument('--model', type=str, required=True, help='Path to model.onnx')
-    parser.add_argument('--video', type=str, required=True, help='Path to input video')
-    parser.add_argument('--audio', type=str, required=True, help='Path to input audio (.wav) or features (.npy)')
-    parser.add_argument('--output', type=str, default='result.mp4', help='Path to output video')
-    parser.add_argument('--hubert_path', type=str, default=None, help='Path to chinese-hubert-large model')
-    parser.add_argument('--device', type=str, default='cpu', help='Device (cpu or cuda)')
+    parser = argparse.ArgumentParser(description='Inference code to lip-sync videos in the wild using Wav2Lip models')
+
+    parser.add_argument('--checkpoint_path', type=str, required=True, help='Name of saved checkpoint to load weights from')
+    parser.add_argument('--face', type=str, required=True, help='Filepath of video/image that contains faces to use')
+    parser.add_argument('--audio', type=str, required=True, help='Filepath of video/audio file to use as raw audio source')
+    parser.add_argument('--outfile', type=str, default='results/result_voice.mp4', help='Video path to save result')
+    parser.add_argument('--static', type=bool, default=False, help='If True, then use only first video frame for inference')
+    parser.add_argument('--fps', type=float, default=25., help='Can be specified only if input is a static image')
+    parser.add_argument('--pads', nargs='+', type=int, default=[0, 10, 0, 0], help='Padding (top, bottom, left, right)')
+    parser.add_argument('--face_det_batch_size', type=int, default=16, help='Batch size for face detection')
+    parser.add_argument('--wav2lip_batch_size', type=int, default=128, help='Batch size for Wav2Lip model(s)')
+    parser.add_argument('--resize_factor', default=1, type=int, help='Reduce the resolution by this factor')
+    parser.add_argument('--crop', nargs='+', type=int, default=[0, -1, 0, -1], help='Crop video to a smaller region')
+    parser.add_argument('--box', nargs='+', type=int, default=[-1, -1, -1, -1], help='Specify a constant bounding box')
+    parser.add_argument('--rotate', default=False, action='store_true', help='Rotate video 90deg')
+    parser.add_argument('--nosmooth', default=False, action='store_true', help='Prevent smoothing face detections')
+    
+    # New args
+    parser.add_argument('--hubert_path', type=str, default=None, help='Path to HuBERT model for feature extraction')
+    parser.add_argument('--device', type=str, default='cuda', help='Device (cpu or cuda)')
+    
     args = parser.parse_args()
+    args.img_size = 96 # Will be overwritten by ONNX input check
 
-    # 1. Load Audio Features
-    inference = Wav2LipInference(args.model, args.hubert_path, args.device)
-    audio_feat = inference.get_audio_features(args.audio)
+    if not os.path.isfile(args.face):
+        raise ValueError('--face argument must be a valid path to video/image file')
+
+    # 1. Load Face
+    if args.face.split('.')[1] in ['jpg', 'png', 'jpeg']:
+        full_frames = [cv2.imread(args.face)]
+        fps = args.fps
+        args.static = True
+    else:
+        video_stream = cv2.VideoCapture(args.face)
+        fps = video_stream.get(cv2.CAP_PROP_FPS)
+        print('Reading video frames...')
+        full_frames = []
+        while 1:
+            still_reading, frame = video_stream.read()
+            if not still_reading:
+                video_stream.release()
+                break
+            if args.resize_factor > 1:
+                frame = cv2.resize(frame, (frame.shape[1]//args.resize_factor, frame.shape[0]//args.resize_factor))
+            if args.rotate:
+                frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+            y1, y2, x1, x2 = args.crop
+            if x2 == -1: x2 = frame.shape[1]
+            if y2 == -1: y2 = frame.shape[0]
+            frame = frame[y1:y2, x1:x2]
+            full_frames.append(frame)
+    print ("Number of frames available for inference: "+str(len(full_frames)))
+
+    # 2. Process Audio (HuBERT Feature Extraction)
+    if not args.audio.endswith('.wav'):
+        print('Extracting raw audio...')
+        command = 'ffmpeg -y -i {} -strict -2 {}'.format(args.audio, 'temp/temp.wav')
+        subprocess.call(command, shell=True)
+        args.audio = 'temp/temp.wav'
+
+    print("Extracting audio features...")
+    # Load audio
+    wav, sr = torchaudio.load(args.audio)
+    if sr != 16000:
+        resampler = torchaudio.transforms.Resample(sr, 16000)
+        wav = resampler(wav)
     
-    # 2. Load Video
-    if not os.path.exists(args.video):
-        print(f"Video file not found: {args.video}")
-        sys.exit(1)
+    # Mix down to mono if needed
+    if wav.shape[0] > 1:
+        wav = torch.mean(wav, dim=0, keepdim=True)
         
-    cap = cv2.VideoCapture(args.video)
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    frames = []
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frames.append(frame)
-    cap.release()
-    
-    if len(frames) == 0:
-        print("No frames read from video.")
-        sys.exit(1)
-        
-    # 3. Run Inference
-    result_frames = inference.run(frames, audio_feat)
-    
-    # 4. Save Video
-    if len(result_frames) > 0:
-        h, w = result_frames[0].shape[:2]
-        out = cv2.VideoWriter('temp_video.avi', cv2.VideoWriter_fourcc(*'DIVX'), fps, (w, h))
-        for frame in result_frames:
-            # Determine if we need to resize back or paste back?
-            # For simplicity, we just save the face result (512x512 typically)
-            # If original video was different, this will result in a cropped/resized video.
-            # To do full face swap, we'd need the face detection/affine transform logic.
-            out.write(frame)
-        out.release()
-        
-        # Merge audio
-        # If audio input is .wav, use it. If .npy, we can't merge audio easily unless original wav provided.
-        audio_cmd = []
-        if args.audio.endswith('.wav') or args.audio.endswith('.mp3'):
-            cmd = f"ffmpeg -y -i temp_video.avi -i {args.audio} -c:v libx264 -c:a aac -strict experimental -shortest {args.output}"
-            subprocess.call(cmd, shell=True)
-            print(f"Saved result to {args.output}")
+    # Extract HuBERT features
+    if args.hubert_path:
+        feature_extractor = HubertFeatureExtractor(args.hubert_path, args.device)
+        audio_feat = feature_extractor.infer(wav.numpy()[0]) # (1, T, 1024)
+        # Transpose to (1, 1024, T) to match get_lips_result.py logic
+        audio_tensor = audio_feat.transpose(0, 2, 1) 
+    else:
+        # Fallback or error?
+        print("WARNING: No --hubert_path provided. Using random noise for testing.")
+        # Create dummy features matching expected duration
+        # HuBERT is 50Hz. Duration = wav length / 16000
+        duration = wav.shape[1] / 16000
+        num_frames = int(duration * 50)
+        audio_tensor = np.random.randn(1, 1024, num_frames).astype(np.float32)
+
+    print(f"Audio tensor shape: {audio_tensor.shape}")
+
+    # 3. Face Detection
+    if args.box[0] == -1:
+        if not args.static:
+            face_det_results = face_detect(full_frames, args)
         else:
-            print(f"Audio is .npy, saving video without audio merging to {args.output}")
-            # Rename temp to output
-            shutil.move('temp_video.avi', args.output)
+            face_det_results = face_detect([full_frames[0]], args)
+    else:
+        print('Using the specified bounding box instead of face detection...')
+        y1, y2, x1, x2 = args.box
+        face_det_results = [[f[y1: y2, x1:x2], (y1, y2, x1, x2)] for f in full_frames]
 
-if __name__ == "__main__":
-    import shutil
+    # 4. Load Model
+    model = load_onnx_model(args.checkpoint_path, args.device)
+    print("Model loaded")
+    
+    # Check model inputs
+    onnx_inputs = model.get_inputs()
+    input_names = [inp.name for inp in onnx_inputs]
+    print(f"Model inputs: {input_names}")
+    
+    # Check for img_size in ONNX model
+    for inp in onnx_inputs:
+        if 'face' in inp.name or 'img' in inp.name:
+            if len(inp.shape) == 4:
+                # Assuming (Batch, C, H, W)
+                if isinstance(inp.shape[2], int):
+                    args.img_size = inp.shape[2]
+                    print(f"Set img_size to {args.img_size} based on model.")
+    
+    # 5. Inference Loop
+    gen = datagen(full_frames.copy(), audio_tensor, face_det_results, args)
+    
+    # Prepare video writer
+    frame_h, frame_w = full_frames[0].shape[:-1]
+    out = cv2.VideoWriter('temp/result.avi', cv2.VideoWriter_fourcc(*'DIVX'), fps, (frame_w, frame_h))
+    
+    batch_size = args.wav2lip_batch_size
+    
+    # Check dtype
+    dtype = np.float32
+    if 'float16' in onnx_inputs[0].type:
+        dtype = np.float16
+        
+    for i, (img_batch, mel_batch, frames, coords) in enumerate(tqdm(gen)):
+        
+        img_batch = img_batch.astype(dtype)
+        mel_batch = mel_batch.astype(dtype)
+        
+        # Prepare hidden states (hn, cn)
+        # Assuming (Batch, 2, 512) transposed to (2, Batch, 512)
+        batch_size_curr = img_batch.shape[0]
+        hn = np.zeros((batch_size_curr, 2, 512), dtype=dtype)
+        cn = np.zeros((batch_size_curr, 2, 512), dtype=dtype)
+        
+        # Transpose to (2, B, 512)
+        hn = np.transpose(hn, (1, 0, 2))
+        cn = np.transpose(cn, (1, 0, 2))
+        
+        inputs = {}
+        # Map inputs based on names
+        for name in input_names:
+            if 'audio' in name:
+                inputs[name] = mel_batch
+            elif 'face' in name:
+                inputs[name] = img_batch
+            elif 'in_hn' in name:
+                inputs[name] = hn
+            elif 'in_cn' in name:
+                inputs[name] = cn
+                
+        # Run inference
+        try:
+            # We assume the first output is the predicted face
+            # Or use explicit names if known: ['pred_face', 'out_hn', 'out_cn']
+            pred = model.run(['pred_face'], inputs)[0]
+        except Exception as e:
+            print(f"Inference failed: {e}")
+            sys.exit(1)
+            
+        pred = pred.astype(np.float32)
+        # Output shape is typically (Batch, C, H, W). Transpose to (Batch, H, W, C)
+        pred = pred.transpose(0, 2, 3, 1) * 255.
+        
+        for p, f, c in zip(pred, frames, coords):
+            y1, y2, x1, x2 = c
+            
+            # Resize prediction to original face box size
+            p = cv2.resize(p.astype(np.uint8), (x2 - x1, y2 - y1))
+            
+            # Simple Poisson Blending or Soft Blending could help reducing the "box" effect
+            # But first let's ensure the color space is correct.
+            # cv2.imread reads as BGR.
+            # Wav2Lip training usually assumes RGB input if using skvideo/PIL, or BGR if using cv2.
+            # Standard Wav2Lip inference.py uses cv2.imread (BGR) and doesn't convert to RGB for model input explicitly in datagen.
+            # But let's check if the model output needs BGR/RGB conversion.
+            # If the model output is RGB (common in PyTorch models trained with PIL), we might need to convert to BGR for cv2.imwrite.
+            
+            # If the result has color shift (blue tint?), it means model output is RGB but we save as BGR (or vice versa).
+            # Let's assume model output is BGR (since input was BGR).
+            
+            f[y1:y2, x1:x2] = p
+            out.write(f)
+            
+    out.release()
+    
+    command = 'ffmpeg -y -i {} -i {} -strict -2 -q:v 1 {}'.format(args.audio, 'temp/result.avi', args.outfile)
+    subprocess.call(command, shell=platform.system() != 'Windows')
+
+if __name__ == '__main__':
     main()
-
