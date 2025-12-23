@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 import torchaudio
 import onnxruntime as ort
-from transformers import HubertModel
+from transformers import HubertModel, Wav2Vec2FeatureExtractor
 from tqdm import tqdm
 import subprocess
 import platform
@@ -36,7 +36,7 @@ parser.add_argument('--rotate', default=False, action='store_true', help='Rotate
 parser.add_argument('--nosmooth', default=False, action='store_true', help='Disable smoothing for detected boxes')
 
 args = parser.parse_args()
-args.img_size = 96
+args.img_size = 512
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(f'Using {device} for inference.')
@@ -99,9 +99,10 @@ def face_detect(images):
 	return results 
 
 
-def load_hubert_model(model_path):
-	model = HubertModel.from_pretrained(model_path)
-	return model.to(device).eval()
+def load_hubert_and_processor(model_path):
+	model = HubertModel.from_pretrained(model_path).to(device).eval()
+	processor = Wav2Vec2FeatureExtractor.from_pretrained(model_path)
+	return model, processor
 
 
 def extract_hubert_features(audio_path, model_path):
@@ -112,27 +113,29 @@ def extract_hubert_features(audio_path, model_path):
 	if wav.shape[0] > 1:
 		wav = torch.mean(wav, dim=0, keepdim=True)
 
-	wav = wav.to(device)
-	model = load_hubert_model(model_path)
+	# 使用官方特征提取器，保持与服务端一致的归一化和预处理
+	wav_np = wav.squeeze(0).cpu().numpy()
+	model, processor = load_hubert_and_processor(model_path)
+	processed = processor(wav_np, sampling_rate=16000, return_tensors="pt").input_values.to(device)
 
 	kernel, stride = 400, 320
 	clip_length = stride * 1000  # ~20s per chunk to avoid OOM
-	expected_T = (wav.shape[1] - (kernel - stride)) // stride
+	expected_T = (processed.shape[1] - (kernel - stride)) // stride
 
 	with torch.no_grad():
-		if wav.shape[1] <= clip_length:
-			hidden_states = model(wav).last_hidden_state
+		if processed.shape[1] <= clip_length:
+			hidden_states = model(processed).last_hidden_state
 		else:
 			res_lst = []
-			num_iter = wav.shape[1] // clip_length
+			num_iter = processed.shape[1] // clip_length
 			for i in range(num_iter):
 				start_idx = i * clip_length
 				end_idx = start_idx + (clip_length - stride + kernel)
-				chunk = wav[:, start_idx:end_idx]
+				chunk = processed[:, start_idx:end_idx]
 				if chunk.shape[1] >= kernel:
 					res_lst.append(model(chunk).last_hidden_state[0])
 			remaining_start = num_iter * clip_length
-			remaining = wav[:, remaining_start:]
+			remaining = processed[:, remaining_start:]
 			if remaining.shape[1] >= kernel:
 				res_lst.append(model(remaining).last_hidden_state[0])
 			if len(res_lst) > 0:
@@ -149,11 +152,15 @@ def extract_hubert_features(audio_path, model_path):
 	return hidden_states.cpu().numpy()
 
 
-def create_rep_chunks(audio_tensor, num_frames):
-	rep_step_size = 10
-	rep_idx_multiplier = 2
-	chunks, frame_indices = [], []
+def create_rep_chunks(audio_tensor, num_frames, fps):
+	"""将 HuBERT 特征切成与视频帧对齐的窗口。
+	   rep_idx_multiplier 按实际 fps 计算，避免口型与音频脱节。
+	"""
+	rep_step_size = 10  # 与 ONNX 输入一致
+	# 线上服务固定 25fps，对应 50Hz HuBERT -> multiplier=2
+	rep_idx_multiplier = 2.0
 
+	chunks, frame_indices = [], []
 	total = audio_tensor.shape[-1]
 	i = 0
 	while True:
@@ -170,7 +177,11 @@ def create_rep_chunks(audio_tensor, num_frames):
 			chunk = np.pad(chunk, ((0, 0), (0, pad)), mode='edge')
 
 		chunks.append(chunk)
-		idx = i % num_frames if (i // num_frames) % 2 == 0 else num_frames - 1 - i % num_frames
+		# 恢复线上 ping-pong 帧选择逻辑
+		if args.static:
+			idx = 0
+		else:
+			idx = i % num_frames if i // num_frames % 2 == 0 else num_frames - 1 - i % num_frames
 		frame_indices.append(idx)
 		i += 1
 
@@ -280,7 +291,7 @@ def main():
 		y1, y2, x1, x2 = args.box
 		face_det_results = [[f[y1: y2, x1:x2], (y1, y2, x1, x2)] for f in full_frames]
 
-	rep_chunks, frame_indices = create_rep_chunks(audio_tensor, len(full_frames))
+	rep_chunks, frame_indices = create_rep_chunks(audio_tensor, len(full_frames), fps)
 	if len(rep_chunks) == 0:
 		raise ValueError('Audio features too short to create chunks.')
 	print(f'Number of audio chunks: {len(rep_chunks)}')
@@ -288,8 +299,8 @@ def main():
 	model = load_onnx_model(args.checkpoint_path)
 	print('Model loaded')
 
-	args.img_size = adjust_img_size_from_onnx(model)
-	print(f'Using img_size={args.img_size} based on model input.')
+	# 线上固定 img_size=512，忽略模型输入尺寸
+	print(f'Using img_size={args.img_size} (fixed to 512 for online compatibility).')
 
 	onnx_inputs = model.get_inputs()
 	input_names = [inp.name for inp in onnx_inputs]
